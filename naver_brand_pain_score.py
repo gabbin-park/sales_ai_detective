@@ -21,9 +21,11 @@ import os
 import time
 import re
 import csv
+import json
 import math
 import random
 import logging
+import subprocess
 from dataclasses import dataclass, field, asdict
 from collections import Counter
 from datetime import datetime, timedelta
@@ -504,56 +506,104 @@ class BrandAnalyzer:
 # ─────────────────────────────────────────────────────────────────────────────
 # brand.naver.com 택배사 / 3PL 조회
 # ─────────────────────────────────────────────────────────────────────────────
+_BRAND_NAVER_LINK_RE = re.compile(
+    r"https://brand\.naver\.com/[^/]+/products/(\d+)"
+)
+
+
+def _brand_product_ids_from_items(products: list[dict], max_n: int = 5) -> list[str]:
+    """
+    Shopping API 응답 items에서 brand.naver.com 상품 ID 추출.
+    우선순위: link 필드의 brand.naver.com URL > productId 필드
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+
+    for p in products:
+        # link 필드에서 brand.naver.com URL 파싱
+        link = p.get("link") or p.get("mallProductUrl") or ""
+        m = _BRAND_NAVER_LINK_RE.search(link)
+        if m:
+            pid = m.group(1)
+            if pid not in seen:
+                ids.append(pid)
+                seen.add(pid)
+
+        if len(ids) >= max_n:
+            break
+
+    # brand.naver.com URL이 없으면 productId 폴백
+    if not ids:
+        for p in products:
+            pid = str(p.get("productId") or "").strip()
+            if pid and pid not in seen:
+                ids.append(pid)
+                seen.add(pid)
+            if len(ids) >= max_n:
+                break
+
+    return ids
+
+
 def fetch_brand_delivery_info(product_id: str, nid_ses: str, nid_aut: str) -> dict:
     """
-    brand.naver.com XHR API로 택배사·3PL 정보 추출.
+    brand.naver.com XHR API로 택배사·3PL 정보 추출 (curl subprocess 사용).
+
+    Python requests는 TLS 핑거프린트(JA3)로 nfront에 차단되므로
+    curl을 subprocess로 호출해 브라우저와 동일한 TLS 핸드셰이크를 사용.
 
     Endpoint:
       GET https://brand.naver.com/n/v1/group-products/{product_id}?channelServiceType=STOREFARM
 
     Response 매핑:
-      productDeliveryInfo.deliveryCompany.name  → courier_company (택배사)
-      productLogistics.logisticsCompanyName     → threepl (3PL)
-
-    Args:
-      product_id: 네이버 쇼핑 상품 ID (Naver Shopping API의 productId 필드)
-      nid_ses:    브라우저 NID_SES 쿠키값
-      nid_aut:    브라우저 NID_AUT 쿠키값
-
-    Returns:
-      {"courier_company": str, "threepl": str}  — 미수집 시 "미확인"
+      products[0].productDeliveryInfo.deliveryCompany.name  → courier_company
+      products[0].productLogistics.logisticsCompanyName     → threepl
     """
     url = BRAND_NAVER_PRODUCT_URL.format(product_id=product_id)
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Referer": f"https://brand.naver.com/",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "Cookie": f"NID_AUT={nid_aut}; NID_SES={nid_ses}",
-    }
+    cookie_str = f"NID_AUT={nid_aut}; NID_SES={nid_ses}"
+    cmd = [
+        "curl", "-s", "--max-time", "12",
+        "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "-H", "Accept: application/json, text/plain, */*",
+        "-H", "Accept-Language: ko-KR,ko;q=0.9",
+        "-H", f"Referer: https://brand.naver.com/",
+        "-H", "sec-fetch-dest: empty",
+        "-H", "sec-fetch-mode: cors",
+        "-H", "sec-fetch-site: same-origin",
+        "-H", f"Cookie: {cookie_str}",
+        "-w", "\n__STATUS__%{http_code}",
+        url,
+    ]
     try:
-        r = requests.get(url, headers=headers, timeout=12)
-        if r.status_code == 200:
-            d = r.json()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        raw = result.stdout
+        # 마지막 줄에서 HTTP 상태코드 분리
+        if "__STATUS__" in raw:
+            body, status_str = raw.rsplit("__STATUS__", 1)
+            status = int(status_str.strip())
+        else:
+            body, status = raw, 0
+
+        if status == 200:
+            d = json.loads(body)
+            # 응답은 products 배열 형태
+            first = d.get("products", [{}])[0] if d.get("products") else d
             courier = (
-                d.get("productDeliveryInfo", {})
-                 .get("deliveryCompany", {})
-                 .get("name", "미확인") or "미확인"
+                first.get("productDeliveryInfo", {})
+                     .get("deliveryCompany", {})
+                     .get("name", "") or ""
             )
             threepl = (
-                d.get("productLogistics", {})
-                 .get("logisticsCompanyName", "미확인") or "미확인"
+                first.get("productLogistics", {})
+                     .get("logisticsCompanyName", "") or ""
             )
-            return {"courier_company": courier, "threepl": threepl}
-        log.debug("fetch_brand_delivery_info: %s → HTTP %d", product_id, r.status_code)
-    except requests.RequestException as e:
+            if courier or threepl:
+                return {
+                    "courier_company": courier or "미확인",
+                    "threepl":         threepl or "미확인",
+                }
+        log.debug("fetch_brand_delivery_info: %s → HTTP %d", product_id, status)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
         log.debug("fetch_brand_delivery_info 오류 (%s): %s", product_id, e)
     return {"courier_company": "미확인", "threepl": "미확인"}
 
@@ -563,23 +613,21 @@ def enrich_courier_info(
     brand_products: dict[str, list[dict]],
     nid_ses: str,
     nid_aut: str,
-    max_tries: int = 3,
+    max_tries: int = 5,
 ) -> None:
     """
     상위 브랜드의 택배사·3PL 정보를 brand.naver.com API로 채움 (in-place).
 
-    브랜드별로 최대 max_tries개 상품 ID를 시도해 첫 성공값을 사용.
-    NID_SES / NID_AUT 쿠키는 브라우저에서 로그인된 상태의 값이어야 합니다.
+    brand.naver.com link URL에서 product ID를 추출해 API 호출.
+    브랜드당 최대 max_tries개 상품을 시도해 첫 성공값을 사용.
     """
     for m in tqdm(metrics_list, desc="택배사 정보 수집"):
         products = brand_products.get(m.brand, [])
-        product_ids = []
-        for p in products:
-            pid = str(p.get("productId") or "").strip()
-            if pid and pid not in product_ids:
-                product_ids.append(pid)
-            if len(product_ids) >= max_tries:
-                break
+        product_ids = _brand_product_ids_from_items(products, max_n=max_tries)
+
+        if not product_ids:
+            log.debug("  [배송정보] %s: brand.naver.com 상품 없음", m.brand)
+            continue
 
         for pid in product_ids:
             info = fetch_brand_delivery_info(pid, nid_ses, nid_aut)
