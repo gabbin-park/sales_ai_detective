@@ -43,7 +43,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── 환경 변수 ──────────────────────────────────────────────────────────────────
+# ── 환경 변수 (.env 파일 자동 로드) ────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv 미설치 시 무시 (환경변수 직접 설정으로 대체)
+
 NAVER_CLIENT_ID     = os.getenv("NAVER_CLIENT_ID", "YOUR_CLIENT_ID")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "YOUR_CLIENT_SECRET")
 
