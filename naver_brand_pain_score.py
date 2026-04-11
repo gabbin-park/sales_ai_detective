@@ -47,6 +47,7 @@ NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "YOUR_CLIENT_SECRET")
 
 NAVER_SEARCH_URL       = "https://openapi.naver.com/v1/search/shop.json"
 NAVER_DATALAB_URL      = "https://openapi.naver.com/v1/datalab/search"
+BRAND_NAVER_PRODUCT_URL = "https://brand.naver.com/n/v1/group-products/{product_id}?channelServiceType=STOREFARM"
 REQUEST_DELAY          = 0.35   # 초 (API rate limit 준수)
 DATALAB_DELAY          = 0.5    # DataLab API는 좀 더 여유있게
 DATALAB_BATCH_SIZE     = 5      # 요청당 최대 키워드 그룹 수
@@ -501,6 +502,97 @@ class BrandAnalyzer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# brand.naver.com 택배사 / 3PL 조회
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_brand_delivery_info(product_id: str, nid_ses: str, nid_aut: str) -> dict:
+    """
+    brand.naver.com XHR API로 택배사·3PL 정보 추출.
+
+    Endpoint:
+      GET https://brand.naver.com/n/v1/group-products/{product_id}?channelServiceType=STOREFARM
+
+    Response 매핑:
+      productDeliveryInfo.deliveryCompany.name  → courier_company (택배사)
+      productLogistics.logisticsCompanyName     → threepl (3PL)
+
+    Args:
+      product_id: 네이버 쇼핑 상품 ID (Naver Shopping API의 productId 필드)
+      nid_ses:    브라우저 NID_SES 쿠키값
+      nid_aut:    브라우저 NID_AUT 쿠키값
+
+    Returns:
+      {"courier_company": str, "threepl": str}  — 미수집 시 "미확인"
+    """
+    url = BRAND_NAVER_PRODUCT_URL.format(product_id=product_id)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": f"https://brand.naver.com/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "Cookie": f"NID_AUT={nid_aut}; NID_SES={nid_ses}",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            d = r.json()
+            courier = (
+                d.get("productDeliveryInfo", {})
+                 .get("deliveryCompany", {})
+                 .get("name", "미확인") or "미확인"
+            )
+            threepl = (
+                d.get("productLogistics", {})
+                 .get("logisticsCompanyName", "미확인") or "미확인"
+            )
+            return {"courier_company": courier, "threepl": threepl}
+        log.debug("fetch_brand_delivery_info: %s → HTTP %d", product_id, r.status_code)
+    except requests.RequestException as e:
+        log.debug("fetch_brand_delivery_info 오류 (%s): %s", product_id, e)
+    return {"courier_company": "미확인", "threepl": "미확인"}
+
+
+def enrich_courier_info(
+    metrics_list: list["BrandMetrics"],
+    brand_products: dict[str, list[dict]],
+    nid_ses: str,
+    nid_aut: str,
+    max_tries: int = 3,
+) -> None:
+    """
+    상위 브랜드의 택배사·3PL 정보를 brand.naver.com API로 채움 (in-place).
+
+    브랜드별로 최대 max_tries개 상품 ID를 시도해 첫 성공값을 사용.
+    NID_SES / NID_AUT 쿠키는 브라우저에서 로그인된 상태의 값이어야 합니다.
+    """
+    for m in tqdm(metrics_list, desc="택배사 정보 수집"):
+        products = brand_products.get(m.brand, [])
+        product_ids = []
+        for p in products:
+            pid = str(p.get("productId") or "").strip()
+            if pid and pid not in product_ids:
+                product_ids.append(pid)
+            if len(product_ids) >= max_tries:
+                break
+
+        for pid in product_ids:
+            info = fetch_brand_delivery_info(pid, nid_ses, nid_aut)
+            if info["courier_company"] != "미확인" or info["threepl"] != "미확인":
+                m.courier_company = info["courier_company"]
+                m.threepl         = info["threepl"]
+                log.info("  [배송정보] %s → 택배사=%s / 3PL=%s",
+                         m.brand, m.courier_company, m.threepl)
+                break
+            time.sleep(0.4)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 정규화 유틸
 # ─────────────────────────────────────────────────────────────────────────────
 def min_max_normalize(values: list[float]) -> list[float]:
@@ -534,13 +626,20 @@ def run_pipeline(
     min_products: int = 3,
     top_n: int = 20,
     output_path: str = OUTPUT_CSV,
+    nid_ses: str = "",
+    nid_aut: str = "",
 ) -> pd.DataFrame:
-    """전체 분석 파이프라인 실행 후 DataFrame 반환"""
+    """전체 분석 파이프라인 실행 후 DataFrame 반환
 
+    Args:
+      nid_ses: 브라우저 NID_SES 쿠키 (택배사 정보 수집용, 선택사항)
+      nid_aut: 브라우저 NID_AUT 쿠키 (택배사 정보 수집용, 선택사항)
+    """
     client   = NaverShoppingClient(NAVER_CLIENT_ID, NAVER_CLIENT_SECRET)
     datalab  = NaverDataLabClient(NAVER_CLIENT_ID, NAVER_CLIENT_SECRET)
     analyzer = BrandAnalyzer(client, datalab)
     all_metrics: list[BrandMetrics] = []
+    all_brand_products: dict[str, list[dict]] = {}   # 택배사 조회용 보관
 
     for category in tqdm(categories, desc="카테고리 분석"):
         brand_products = analyzer.collect_brand_products(category)
@@ -567,6 +666,7 @@ def run_pipeline(
             trend = trend_map.get(brand)   # None이면 중립값(0.5) 적용
             m = analyzer.build_metrics(brand, category, products, trend=trend)
             all_metrics.append(m)
+            all_brand_products[brand] = products
 
     if not all_metrics:
         log.warning("분석 가능한 브랜드 데이터가 없습니다.")
@@ -581,6 +681,16 @@ def run_pipeline(
 
     all_metrics.sort(key=lambda x: x.pain_score, reverse=True)
     top_brands = all_metrics[:top_n]
+
+    # ── 택배사 / 3PL 정보 수집 (쿠키 제공 시) ────────────────────────────────
+    if nid_ses and nid_aut:
+        log.info("[배송정보] brand.naver.com API로 상위 %d개 브랜드 택배사 조회 시작", len(top_brands))
+        enrich_courier_info(top_brands, all_brand_products, nid_ses, nid_aut)
+    else:
+        log.info(
+            "[배송정보] NID_SES/NID_AUT 미제공 → courier_company/threepl = '미확인'\n"
+            "  택배사 정보가 필요하면 --nid-ses, --nid-aut 옵션으로 브라우저 쿠키를 전달하세요."
+        )
 
     # ── CSV 저장 ──────────────────────────────────────────────────────────────
     fieldnames = list(asdict(top_brands[0]).keys())
@@ -657,6 +767,10 @@ if __name__ == "__main__":
                         help="최소 상품 수 필터 (기본값: 3)")
     parser.add_argument("--output", default=OUTPUT_CSV,
                         help=f"출력 CSV 경로 (기본값: {OUTPUT_CSV})")
+    parser.add_argument("--nid-ses", default="",
+                        help="브라우저 NID_SES 쿠키값 (택배사/3PL 조회용, 선택사항)")
+    parser.add_argument("--nid-aut", default="",
+                        help="브라우저 NID_AUT 쿠키값 (택배사/3PL 조회용, 선택사항)")
     args = parser.parse_args()
 
     df = run_pipeline(
@@ -664,5 +778,7 @@ if __name__ == "__main__":
         min_products=args.min_products,
         top_n=args.top,
         output_path=args.output,
+        nid_ses=args.nid_ses,
+        nid_aut=args.nid_aut,
     )
     print_report(df)
