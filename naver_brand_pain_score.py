@@ -86,11 +86,28 @@ TARGET_CATEGORIES = [
     "패션의류",
     "스킨케어",
     "헬스/건강식품",
-    "주방용품",
-    "반려동물용품",
-    "캠핑/등산",
-    "유아동",
 ]
+
+# ── Brand Store(brand.naver.com) 브랜드 위주 검색어 ───────────────────────────
+# 카테고리 일반 검색어만으론 SmartStore 결과가 대부분을 차지함.
+# 아래 키워드를 추가 검색해 brand.naver.com 상품을 더 많이 수집함.
+BRAND_STORE_SEARCH_TERMS: dict[str, list[str]] = {
+    "패션의류": [
+        "나이키", "아디다스", "뉴발란스", "MLB", "폴로랄프로렌",
+        "타미힐피거", "캘빈클라인", "리바이스", "아이더", "K2",
+        "노스페이스", "컬럼비아", "네파", "블랙야크", "자라",
+    ],
+    "스킨케어": [
+        "아모레퍼시픽", "설화수", "이니스프리", "헤라", "라네즈",
+        "에스트라", "닥터자르트", "오휘", "후", "숨37",
+        "LG생활건강", "CNP", "AHC", "달바", "토리든",
+    ],
+    "헬스/건강식품": [
+        "종근당건강", "CJ웰케어", "한미약품", "일동제약", "유한양행",
+        "GC녹십자", "동국제약", "광동제약", "네이처리퍼블릭", "뉴트리원",
+        "암웨이", "뉴스킨", "한국암웨이", "솔가", "센트룸",
+    ],
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -608,6 +625,83 @@ def fetch_brand_delivery_info(product_id: str, nid_ses: str, nid_aut: str) -> di
     return {"courier_company": "미확인", "threepl": "미확인"}
 
 
+_SMARTSTORE_LINK_RE = re.compile(
+    r"https://smartstore\.naver\.com/[^/]+/products/(\d+)"
+)
+_SMARTSTORE_API_PAT = re.compile(r"/i/v2/channels/[^/]+/products/\d+")
+
+
+def fetch_smartstore_delivery_playwright(
+    product_link: str,
+    nid_ses: str,
+    nid_aut: str,
+) -> dict:
+    """
+    Playwright(headless=False)로 SmartStore 상품 페이지를 로드해
+    /i/v2/channels/.../products/... XHR 응답을 인터셉트, 택배사 추출.
+
+    headless=False 이유:
+      SmartStore nfront이 headless Chrome의 JS 지표를 탐지해 490(CAPTCHA)를 반환함.
+      실제 창을 띄우면 탐지가 되지 않음.
+
+    Returns:
+      {"courier_company": str, "threepl": str}
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # 선택적 의존성
+    except ImportError:
+        log.warning("playwright 미설치 → pip install playwright && playwright install chromium")
+        return {"courier_company": "미확인", "threepl": "미확인"}
+
+    captured: dict = {}
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=False)
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+            )
+            ctx.add_cookies([
+                {"name": "NID_SES", "value": nid_ses, "domain": ".naver.com", "path": "/"},
+                {"name": "NID_AUT", "value": nid_aut, "domain": ".naver.com", "path": "/"},
+            ])
+            page = ctx.new_page()
+
+            def on_response(resp):
+                if _SMARTSTORE_API_PAT.search(resp.url) and "withWindow=false" in resp.url:
+                    if resp.status == 200:
+                        try:
+                            captured["data"] = resp.json()
+                        except Exception:
+                            pass
+
+            page.on("response", on_response)
+            try:
+                page.goto(product_link, wait_until="networkidle", timeout=35000)
+            except Exception:
+                pass  # timeout 무시 — 응답 인터셉트는 이미 됐을 수 있음
+
+            browser.close()
+    except Exception as e:
+        log.debug("fetch_smartstore_delivery_playwright 오류: %s", e)
+        return {"courier_company": "미확인", "threepl": "미확인"}
+
+    if "data" in captured:
+        di = captured["data"].get("productDeliveryInfo") or {}
+        company = di.get("deliveryCompany") or {}
+        courier = company.get("name") or ""
+        # SmartStore API는 3PL 필드 없음 — deliveryCompany.name 으로 통일
+        if courier:
+            return {"courier_company": courier, "threepl": "미확인"}
+
+    return {"courier_company": "미확인", "threepl": "미확인"}
+
+
 def enrich_courier_info(
     metrics_list: list["BrandMetrics"],
     brand_products: dict[str, list[dict]],
@@ -616,28 +710,49 @@ def enrich_courier_info(
     max_tries: int = 5,
 ) -> None:
     """
-    상위 브랜드의 택배사·3PL 정보를 brand.naver.com API로 채움 (in-place).
+    상위 브랜드의 택배사·3PL 정보 수집 (in-place).
 
-    brand.naver.com link URL에서 product ID를 추출해 API 호출.
-    브랜드당 최대 max_tries개 상품을 시도해 첫 성공값을 사용.
+    경로 1 — brand.naver.com 상품: curl subprocess (TLS 우회)
+    경로 2 — SmartStore 상품     : Playwright headless=False (CAPTCHA 우회)
     """
     for m in tqdm(metrics_list, desc="택배사 정보 수집"):
         products = brand_products.get(m.brand, [])
-        product_ids = _brand_product_ids_from_items(products, max_n=max_tries)
-
-        if not product_ids:
-            log.debug("  [배송정보] %s: brand.naver.com 상품 없음", m.brand)
+        if not products:
             continue
 
-        for pid in product_ids:
+        # ── 경로 1: brand.naver.com ──────────────────────────────────────────
+        brand_ids = _brand_product_ids_from_items(products, max_n=max_tries)
+        for pid in brand_ids:
             info = fetch_brand_delivery_info(pid, nid_ses, nid_aut)
             if info["courier_company"] != "미확인" or info["threepl"] != "미확인":
                 m.courier_company = info["courier_company"]
                 m.threepl         = info["threepl"]
-                log.info("  [배송정보] %s → 택배사=%s / 3PL=%s",
+                log.info("  [brand.naver] %s → 택배사=%s / 3PL=%s",
                          m.brand, m.courier_company, m.threepl)
                 break
             time.sleep(0.4)
+
+        if m.courier_company != "미확인":
+            continue
+
+        # ── 경로 2: SmartStore (Playwright) ──────────────────────────────────
+        ss_links: list[str] = []
+        seen_ss: set[str] = set()
+        for p in products:
+            link = p.get("link") or ""
+            if _SMARTSTORE_LINK_RE.search(link) and link not in seen_ss:
+                ss_links.append(link)
+                seen_ss.add(link)
+            if len(ss_links) >= max_tries:
+                break
+
+        for link in ss_links:
+            info = fetch_smartstore_delivery_playwright(link, nid_ses, nid_aut)
+            if info["courier_company"] != "미확인":
+                m.courier_company = info["courier_company"]
+                log.info("  [smartstore] %s → 택배사=%s",
+                         m.brand, m.courier_company)
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
