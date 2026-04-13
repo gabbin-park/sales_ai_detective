@@ -1,1 +1,1 @@
-# 2026_project_side
+# sales_ai_detective
